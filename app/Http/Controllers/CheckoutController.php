@@ -1,0 +1,526 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\DB;
+use App\Models\CartItem;
+use App\Models\DireccionEnvio;
+use App\Models\Pago; 
+use App\Models\Pedido;
+use App\Models\PedidoItem;
+use Illuminate\Support\Facades\Log;
+use App\Models\Cupon;
+use Illuminate\Support\Facades\Storage;
+
+
+class CheckoutController extends Controller
+{
+    //   VISTA DE ENVÍO
+    public function envio()
+    {
+        $user = Auth::user();
+
+        $items = CartItem::with('producto')
+            ->where('user_id', $user->id)
+            ->get();
+
+        if ($items->isEmpty()) {
+            return redirect()->route('cart.index')
+                ->with('error', 'Tu carrito está vacío.');
+        }
+
+        $subtotal = $items->sum(fn($i) => $i->producto->precio * $i->cantidad);
+        $igv = $subtotal * 0.18;
+        $envio = 10;
+        $descuento = session('cupon_descuento', 0);
+        $total = ($subtotal + $igv + $envio) - $descuento;
+
+        $direccion = DireccionEnvio::where('user_id', $user->id)
+            ->latest()
+            ->first();
+
+        return view('checkout.envio', compact(
+            'items', 'subtotal', 'igv', 'envio', 'total', 'direccion'
+        ));
+    }
+
+    // ============================
+    //   VISTA POPUP CULQI (FALLBACK)
+    // ============================
+    public function culqiForm(Request $request)
+    {
+        $user = Auth::user();
+        $total = $request->query('total', session('monto_tarjeta', 0));
+
+        if (!$user) {
+            return redirect()->route('auth.login.form')
+                ->with('error', 'Debes iniciar sesiÃ³n para pagar.');
+        }
+
+        return view('checkout.culqi_pago', [
+            'total' => $total,
+        ]);
+    }
+
+    // ============================
+    //   GUARDAR ENVÍO
+    // ============================
+    public function guardarEnvio(Request $request)
+    {
+        $request->validate([
+            'nombre_completo' => 'required|string|max:255',
+            'direccion'       => 'required|string|max:255',
+            'telefono'        => 'required|string|max:20',
+            'email'           => 'nullable|email|max:255',
+        ]);
+
+        $user = Auth::user();
+
+        $direccion = DireccionEnvio::create([
+            'user_id'        => $user->id,
+            'nombre_completo'=> $request->nombre_completo,
+            'direccion'      => $request->direccion,
+            'telefono'       => $request->telefono,
+            'email'          => $request->email,
+        ]);
+
+        session(['direccion_envio_id' => $direccion->id]);
+
+        return redirect()->route('checkout.pago')
+            ->with('success', 'Información de envío guardada correctamente.');
+    }
+
+    // ============================
+    //   VISTA DE PAGO
+    // ============================
+    public function pago()
+    {
+        $user = Auth::user();
+
+        $items = CartItem::with('producto')
+            ->where('user_id', $user->id)
+            ->get();
+
+        if ($items->isEmpty()) {
+            return redirect()->route('cart.index')
+                ->with('error', 'Tu carrito está vacío.');
+        }
+
+        $subtotal = $items->sum(fn($i) => $i->producto->precio * $i->cantidad);
+        $igv = $subtotal * 0.18;
+        $envio = 10;
+
+        $descuento = session('cupon_descuento', 0);
+        $total = ($subtotal + $igv + $envio) - $descuento;
+
+        return view('checkout.pago', compact('items', 'subtotal', 'igv', 'envio', 'total'));
+    }
+
+    public function procesarPago(Request $request)
+    {
+        $request->validate([
+            'metodo_pago' => 'required|in:tarjeta,yape,plin',
+            'codigo_operacion' => 'nullable|string|max:50',
+            'comprobante' => 'nullable|image|mimes:jpg,jpeg,png|max:5000'
+        ]);
+
+        $user = Auth::user();
+
+        $direccionEnvioId = session('direccion_envio_id');
+
+        $items = CartItem::where('user_id', $user->id)->with('producto')->get();
+        $subtotal = $items->sum(fn($item) => $item->producto->precio * $item->cantidad);
+        $igv = $subtotal * 0.18;
+        $envio = 10;
+        $descuento = session('cupon_descuento', 0);
+        $total = ($subtotal + $igv + $envio) - $descuento;
+
+        $nombreComprobante = null;
+        if ($request->hasFile('comprobante')) {
+            Storage::disk('public')->makeDirectory('comprobantes');
+            $nombreComprobante = time() . '_' . $request->file('comprobante')->getClientOriginalName();
+            // Guardar siempre en el disco público (accessible vía /storage/comprobantes)
+            $request->file('comprobante')->storeAs('comprobantes', $nombreComprobante, 'public');
+        }
+
+        $codigoSeguimiento = 'DC-' . rand(100000, 999999);
+
+        // 🔹 SI ES TARJETA → NO CREAMOS PAGO AQUÍ,
+        // SOLO LO MANDAMOS A CULQI (EL PAGO SE CREA EN culqiPagar)
+        if ($request->metodo_pago === 'tarjeta') {
+            // Guardamos el monto antes de Culqi
+            session(['monto_tarjeta' => $total]);
+            return redirect()->route('checkout.pago')
+                ->with('info', 'Abre la ventana de Culqi para completar el pago con tarjeta.');
+        }
+        
+
+        // 🔹 YAPE / PLIN → AQUÍ SIGUE TODO IGUAL
+        $pago = Pago::create([
+            'user_id' => $user->id,
+            'direccion_envio_id' => session('direccion_envio_id'),
+            'metodo_pago' => $request->metodo_pago,
+            'monto' => $total,
+            'estado' => 'pendiente',
+            'codigo_operacion' => $request->codigo_operacion ?? null,
+            'numero_tarjeta' => $request->numero_tarjeta ?? null,
+            'nombre_titular' => $request->nombre_titular ?? null,
+            'vencimiento' => $request->vencimiento ?? null,
+            'cvv' => $request->cvv ?? null,
+            'comprobante' => $nombreComprobante,
+        ]);
+
+        $pedido = Pedido::create([
+            'user_id' => $user->id,
+            'direccion_envio_id' => $direccionEnvioId,
+            'pago_id' => $pago->id,
+            'estado' => 'pendiente',
+            'total' => $total,
+            'metodo_pago' => $request->metodo_pago,
+            'codigo_operacion' => $request->codigo_operacion,
+            'comprobante' => $nombreComprobante,
+            'codigo_seguimiento' => $codigoSeguimiento,
+            'subtotal' => $subtotal,
+            'igv' => $igv,
+            'envio' => $envio
+        ]);
+
+        foreach ($items as $item) {
+            PedidoItem::create([
+                'pedido_id' => $pedido->id,
+                'producto_id' => $item->producto->id,
+                'cantidad' => $item->cantidad,
+                'precio' => $item->producto->precio,
+            ]);
+        }
+
+        session(['pago_id' => $pago->id]);
+
+        return redirect()->route('checkout.resumen')->with('success', 'Pago realizado correctamente.');
+    }
+
+
+
+    // ============================
+    //   FORMULARIO DE PAGO CON CULQI
+
+    public function culqiToken(Request $request)
+{
+    $user = Auth::user();
+
+    $request->validate([
+        'token' => 'required|string',
+    ]);
+
+    // 1. Verificar dirección de envío
+    $direccionEnvioId = session('direccion_envio_id');
+    if (!$direccionEnvioId) {
+        return response()->json([
+            'success' => false,
+            'message' => 'Falta la información de envío.'
+        ], 422);
+    }
+
+    // 2. Obtener carrito
+    $items = CartItem::where('user_id', $user->id)->with('producto')->get();
+    if ($items->isEmpty()) {
+        return response()->json([
+            'success' => false,
+            'message' => 'Tu carrito está vacío.'
+        ], 422);
+    }
+
+    // 3. Calcular totales (aplicando cupón si existe)
+    $subtotal = $items->sum(fn($item) => $item->producto->precio * $item->cantidad);
+    $igv      = $subtotal * 0.18;
+    $envio    = 10;
+    $descuento = session('cupon_descuento', 0);
+    $total    = ($subtotal + $igv + $envio) - $descuento;
+
+    // 4. Crear registro de pago (simulando pago aprobado)
+    $pago = Pago::create([
+        'user_id'            => $user->id,
+        'direccion_envio_id' => $direccionEnvioId,
+        'metodo_pago'        => 'tarjeta',
+        'monto'              => $total,
+        'estado'             => 'pagado',          // ✅ Culqi validó la tarjeta (simulado)
+        'codigo_operacion'   => $request->token,   // Guardamos el token como referencia
+        'numero_tarjeta'     => null,
+        'nombre_titular'     => null,
+        'vencimiento'        => null,
+        'cvv'                => null,
+        'comprobante'        => null,
+    ]);
+
+    // 5. Guardar en sesión para la vista resumen
+    session(['pago_id' => $pago->id]);
+
+    return response()->json([
+        'success' => true,
+    ]);
+}
+
+    // ============================
+    //   GUARDAR PAGO
+    // ============================
+    public function guardarPago(Request $request)
+        {
+            $request->validate([
+                'metodo_pago' => 'required|in:tarjeta,yape,plin,transferencia'
+            ]);
+    
+            // Validaciones según método
+            if ($request->metodo_pago === 'tarjeta') {
+                $request->validate([
+                    'numero_tarjeta' => 'required|digits:16',
+                    'nombre_titular' => 'required|string|max:255',
+                    'vencimiento'    => 'required|string',
+                    'cvv'            => 'required|digits:3',
+                ]);
+            }
+    
+            if ($request->metodo_pago === 'yape' || $request->metodo_pago === 'plin') {
+                $request->validate([
+                    'codigo_operacion' => 'required|string|max:50',
+                    'comprobante'      => 'nullable|image|max:10240',
+                ]);
+            }
+    
+            if ($request->metodo_pago === 'transferencia') {
+                $request->validate([
+                    'comprobante' => 'nullable|image|max:10240',
+                ]);
+            }
+    
+            // Usuario y dirección
+            $user = Auth::user();
+            $direccion_envio_id = session('direccion_envio_id');
+    
+            if (!$direccion_envio_id) {
+                return redirect()->route('checkout.envio')
+                    ->with('error', 'Por favor, completa la información de envío.');
+            }
+    
+            // Calcular totales
+            $items = CartItem::where('user_id', $user->id)->with('producto')->get();
+            $subtotal = $items->sum(fn($i) => $i->producto->precio * $i->cantidad);
+            $igv = $subtotal * 0.18;
+            $envio = 10;
+            $descuento = session('cupon_descuento', 0);
+            $total = ($subtotal + $igv + $envio) - $descuento;
+    
+            // Guardar comprobante si existe
+            $comprobantePath = null;
+    
+            if ($request->hasFile('comprobante')) {
+                Storage::disk('public')->makeDirectory('comprobantes');
+                $comprobantePath = $request->file('comprobante')->store('comprobantes', 'public');
+            }
+
+            // GUARDAR EN DB
+            $pago = Pago::create([
+                'user_id'            => $user->id,
+                'direccion_envio_id' => $direccion_envio_id,
+                'metodo_pago'        => $request->metodo_pago,
+                'monto'              => $total,
+
+                // Tarjeta
+                'numero_tarjeta'     => $request->numero_tarjeta,
+                'nombre_titular'     => $request->nombre_titular,
+                'vencimiento'        => $request->vencimiento,
+                'cvv'                => $request->cvv,
+
+                // Yape / Plin
+                'codigo_operacion'   => $request->codigo_operacion,
+
+                // Comprobante
+                'comprobante'        => $comprobantePath,
+
+                // Estado
+                'estado'             => $request->metodo_pago === 'tarjeta' ? 'pagado' : 'pendiente',
+            ]);
+
+            session(['pago_id' => $pago->id]);
+
+            return redirect()->route('checkout.resumen')
+                ->with('success', 'Pago realizado correctamente.');
+        }
+    // RESUNEN DE PEDIDO
+   public function resumen()
+    {
+        $user = Auth::user();
+        
+        // Recuperar ID de envío y pago
+        $direccion_envio_id = session('direccion_envio_id');
+        $pago_id = session('pago_id');
+    
+        if (!$direccion_envio_id || !$pago_id) {
+            return redirect()->route('checkout.envio')
+                ->with('error', 'Primero completa los pasos anteriores.');
+        }
+    
+        // Recuperar modelos reales
+        $direccion = DireccionEnvio::find($direccion_envio_id);
+        $pago = Pago::find($pago_id);
+    
+        // Método de pago seleccionado
+        $metodo_pago = $pago->metodo_pago;
+    
+        // Carrito del usuario
+        $items = CartItem::with('producto')
+            ->where('user_id', $user->id)
+            ->get();
+    
+        // Calcular totales
+        $subtotal = $items->sum(fn($i) => $i->producto->precio * $i->cantidad);
+        $igv = $subtotal * 0.18;
+        $envio = 10;
+
+        $descuento = session('cupon_descuento', 0);
+        $codigo_cupon = session('cupon_codigo', null);
+    
+        $total = ($subtotal + $igv + $envio) - $descuento;
+    
+        // RETURN FINAL
+        return view('checkout.resumen', compact(
+            'direccion',
+            'pago',
+            'metodo_pago',
+            'items',
+            'subtotal',
+            'igv',
+            'envio',
+            'total',
+            'codigo_cupon',   
+            'descuento' 
+        ));
+    }
+
+    public function confirmarPedido()
+    {
+        $user = Auth::user();
+    
+        // 1. Obtener datos guardados en sesión
+        $direccion_id = session('direccion_envio_id');
+        $pago_id = session('pago_id');
+    
+        $cupon_id = session('cupon_id');           
+        $descuento = session('cupon_descuento');   // <- nombre correcto
+        $codigo_cupon = session('cupon_codigo');   // <- nombre correcto
+    
+        // Validación
+        if (!$direccion_id || !$pago_id) {
+            return redirect()->route('checkout.envio')
+                ->with('error', 'Completa los pasos antes de confirmar el pedido.');
+        }
+    
+        // 2. Obtener productos del carrito
+        $cartItems = CartItem::with('producto')
+            ->where('user_id', $user->id)
+            ->get();
+    
+        if ($cartItems->isEmpty()) {
+            return redirect()->route('cart.index')
+                ->with('error', 'Tu carrito está vacío.');
+        }
+    
+        // 3. Calcular montos
+        $subtotal = $cartItems->sum(fn($item) => $item->producto->precio * $item->cantidad);
+        $igv = $subtotal * 0.18;
+        $envio = 10;
+    
+        // Total con cupón
+        if ($cupon_id && $descuento) {
+            $total = $subtotal + $igv + $envio - $descuento;
+        } else {
+            $total = $subtotal + $igv + $envio;
+        }
+    
+        // 4. Crear código de seguimiento
+        $codigo = 'DC-' . rand(100000, 999999);
+    
+        // 5. Crear el pedido
+        $pago = Pago::find($pago_id);
+        $pedido = Pedido::create([
+            'user_id'             => $user->id,
+            'pago_id'             => $pago_id,
+            'direccion_envio_id'  => $direccion_id,
+    
+            // 🔥 Guardamos cupón
+            'cupon_id'            => $cupon_id,
+            'codigo_cupon'        => $codigo_cupon,
+            'descuento'           => $descuento ?? 0,
+    
+            'codigo_seguimiento'  => $codigo,
+            'subtotal'            => $subtotal,
+            'igv'                 => $igv,
+            'envio'               => $envio,
+            'total'               => $total,
+            'estado'              => 'pendiente',
+            'comprobante'         => $pago?->comprobante,
+            'codigo_operacion'    => $pago?->codigo_operacion,
+            'metodo_pago'         => $pago?->metodo_pago,
+        ]);
+
+        
+        
+
+        // 6. Guardar items del pedido
+        foreach ($cartItems as $item) {
+            PedidoItem::create([
+                'pedido_id'   => $pedido->id,
+                'producto_id' => $item->producto_id,
+                'cantidad'    => $item->cantidad,
+                'precio'      => $item->producto->precio
+            ]);
+        }
+
+        //  Registrar uso del cupón 
+        if ($cupon_id) {
+        
+            // Registrar que el usuario ya usó este cupón
+            DB::table('cupon_usuario')->insert([
+                'user_id'    => $user->id,
+                'cupon_id'   => $cupon_id,
+                'created_at' => now(),
+                'updated_at' => now()
+            ]);
+        
+            // Aumentar contador de usos
+            $cupon = Cupon::find($cupon_id);
+        
+            if ($cupon) {
+                $cupon->usos_realizados += 1;
+        
+                // Si alcanzó el límite, desactivarlo
+                if (!is_null($cupon->limite_uso) && $cupon->usos_realizados >= $cupon->limite_uso) {
+                    $cupon->activo = 0;
+                }
+        
+                $cupon->save();
+            }
+        }
+        
+                // 7. Limpiar carrito
+                CartItem::where('user_id', $user->id)->delete();
+            
+                // 8. Limpiar sesión
+                session()->forget([
+                    'direccion_envio_id',
+                    'pago_id',
+                    'cupon_codigo',
+                    'cupon_descuento',
+                    'cupon_id'
+        ]);
+    
+        // 9. Confirmación final
+        return view('checkout.confirmacion', [
+            'codigo_seguimiento' => $codigo
+        ]);
+    }
+    
+
+
+}
